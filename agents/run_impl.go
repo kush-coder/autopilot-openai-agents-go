@@ -1,0 +1,1602 @@
+// Copyright 2025 The NLP Odyssey Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package agents
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"slices"
+	"sync"
+
+	"github.com/nlpodyssey/openai-agents-go/asyncqueue"
+	"github.com/nlpodyssey/openai-agents-go/computer"
+	"github.com/nlpodyssey/openai-agents-go/modelsettings"
+	"github.com/nlpodyssey/openai-agents-go/openaitypes"
+	"github.com/nlpodyssey/openai-agents-go/tracing"
+	"github.com/openai/openai-go/v3/packages/param"
+	"github.com/openai/openai-go/v3/responses"
+	"github.com/openai/openai-go/v3/shared/constant"
+)
+
+type queueCompleteSentinel struct{}
+
+func (queueCompleteSentinel) isStreamEvent() {}
+
+type AgentToolUseTracker struct {
+	AgentToTools []AgentToToolsItem
+}
+
+func NewAgentToolUseTracker() *AgentToolUseTracker {
+	return &AgentToolUseTracker{}
+}
+
+type AgentToToolsItem struct {
+	Agent     *Agent
+	ToolNames []string
+}
+
+func (item *AgentToToolsItem) AppendToolNames(toolNames []string) {
+	item.ToolNames = append(item.ToolNames, toolNames...)
+}
+
+func (t *AgentToolUseTracker) AddToolUse(agent *Agent, toolNames []string) {
+	index := t.agentIndex(agent)
+	if index == -1 {
+		t.AgentToTools = append(t.AgentToTools, AgentToToolsItem{
+			Agent:     agent,
+			ToolNames: toolNames,
+		})
+	} else {
+		t.AgentToTools[index].AppendToolNames(toolNames)
+	}
+}
+
+func (t *AgentToolUseTracker) HasUsedTools(agent *Agent) bool {
+	index := t.agentIndex(agent)
+	return index != -1 && len(t.AgentToTools[index].ToolNames) > 0
+}
+
+func (t *AgentToolUseTracker) agentIndex(agent *Agent) int {
+	return slices.IndexFunc(t.AgentToTools, func(item AgentToToolsItem) bool {
+		return item.Agent == agent
+	})
+}
+
+type ToolRunHandoff struct {
+	Handoff  Handoff
+	ToolCall ResponseFunctionToolCall
+}
+
+type ToolRunFunction struct {
+	ToolCall     ResponseFunctionToolCall
+	FunctionTool FunctionTool
+}
+
+type ToolRunComputerAction struct {
+	ToolCall     responses.ResponseComputerToolCall
+	ComputerTool ComputerTool
+}
+
+type ToolRunMCPApprovalRequest struct {
+	RequestItem responses.ResponseOutputItemMcpApprovalRequest
+	MCPTool     HostedMCPTool
+}
+
+type ToolRunLocalShellCall struct {
+	ToolCall       responses.ResponseOutputItemLocalShellCall
+	LocalShellTool LocalShellTool
+}
+
+type ProcessedResponse struct {
+	NewItems        []RunItem
+	Handoffs        []ToolRunHandoff
+	Functions       []ToolRunFunction
+	ComputerActions []ToolRunComputerAction
+	LocalShellCalls []ToolRunLocalShellCall
+	// Names of all tools used, including hosted tools
+	ToolsUsed []string
+	// Only requests with callbacks
+	MCPApprovalRequests []ToolRunMCPApprovalRequest
+}
+
+func (pr *ProcessedResponse) HasToolsOrApprovalsToRun() bool {
+	// Handoffs, functions and computer actions need local processing.
+	// Hosted tools have already run, so there's nothing to do.
+	return len(pr.Handoffs) > 0 || len(pr.Functions) > 0 ||
+		len(pr.ComputerActions) > 0 || len(pr.LocalShellCalls) > 0 ||
+		len(pr.MCPApprovalRequests) > 0
+}
+
+type NextStep interface {
+	isNextStep()
+}
+
+type NextStepHandoff struct {
+	NewAgent *Agent
+}
+
+func (NextStepHandoff) isNextStep() {}
+
+type NextStepFinalOutput struct {
+	Output any
+}
+
+func (NextStepFinalOutput) isNextStep() {}
+
+type NextStepRunAgain struct{}
+
+func (NextStepRunAgain) isNextStep() {}
+
+type SingleStepResult struct {
+	// The input items i.e. the items before Run() was called. May be mutated by handoff input filters.
+	OriginalInput Input
+
+	// The model response for the current step.
+	ModelResponse ModelResponse
+
+	// Items generated before the current step.
+	PreStepItems []RunItem
+
+	// Items generated during this current step.
+	NewStepItems []RunItem
+
+	// The next step to take.
+	NextStep NextStep
+}
+
+// GeneratedItems returns the items generated during the agent run (i.e. everything generated after `OriginalInput`).
+func (result SingleStepResult) GeneratedItems() []RunItem {
+	return slices.Concat(result.PreStepItems, result.NewStepItems)
+}
+
+func GetModelTracingImpl(tracingDisabled, traceIncludeSensitiveData bool) ModelTracing {
+	switch {
+	case tracingDisabled:
+		return ModelTracingDisabled
+	case traceIncludeSensitiveData:
+		return ModelTracingEnabled
+	default:
+		return ModelTracingEnabledWithoutData
+	}
+}
+
+type runImpl struct{}
+
+func RunImpl() runImpl { return runImpl{} }
+
+func (ri runImpl) ExecuteToolsAndSideEffects(
+	ctx context.Context,
+	agent *Agent,
+	// The original input to the Runner
+	originalInput Input,
+	// Everything generated by Runner since the original input, but before the current step
+	preStepItems []RunItem,
+	newResponse ModelResponse,
+	processedResponse ProcessedResponse,
+	outputType OutputTypeInterface,
+	hooks RunHooks,
+	runConfig RunConfig,
+) (*SingleStepResult, error) {
+	// Make a copy of the generated items
+	preStepItems = slices.Clone(preStepItems)
+
+	var newStepItems []RunItem
+	newStepItems = append(newStepItems, processedResponse.NewItems...)
+
+	// First, let's run the tool calls - function tools and computer actions
+	childCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var (
+		functionResults []FunctionToolResult
+		computerResults []RunItem
+		toolErrors      [2]error
+		wg              sync.WaitGroup
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		functionResults, toolErrors[0] = ri.ExecuteFunctionToolCalls(
+			childCtx,
+			agent,
+			processedResponse.Functions,
+			hooks,
+			runConfig,
+		)
+	}()
+	go func() {
+		defer wg.Done()
+		computerResults, toolErrors[1] = ri.ExecuteComputerActions(
+			childCtx,
+			agent,
+			processedResponse.ComputerActions,
+			hooks,
+		)
+	}()
+	wg.Wait()
+	if err := errors.Join(toolErrors[:]...); err != nil {
+		return nil, err
+	}
+
+	for _, result := range functionResults {
+		newStepItems = append(newStepItems, result.RunItem)
+	}
+	newStepItems = append(newStepItems, computerResults...)
+
+	// Next, run the MCP approval requests
+	if mcpApprovalRequests := processedResponse.MCPApprovalRequests; len(mcpApprovalRequests) > 0 {
+		approvalResults, err := ri.ExecuteMCPApprovalRequests(ctx, agent, processedResponse.MCPApprovalRequests)
+		if err != nil {
+			return nil, err
+		}
+		newStepItems = append(newStepItems, approvalResults...)
+	}
+
+	// Next, check if there are any handoffs
+	if runHandoffs := processedResponse.Handoffs; len(runHandoffs) > 0 {
+		return ri.ExecuteHandoffs(
+			ctx,
+			agent,
+			originalInput,
+			preStepItems,
+			newStepItems,
+			newResponse,
+			runHandoffs,
+			hooks,
+			runConfig,
+		)
+	}
+
+	// Next, we'll check if the tool use should result in a final output
+	checkToolUse, err := ri.checkForFinalOutputFromTools(ctx, agent, functionResults)
+	if err != nil {
+		return nil, err
+	}
+
+	if checkToolUse.IsFinalOutput {
+		if !checkToolUse.FinalOutput.Valid() {
+			Logger().Error("Model returned a final output of None. Not raising an error because we assume you know what you're doing.")
+		}
+
+		// If the output type is string, then let's just stringify the result
+		if agent.OutputType == nil || agent.OutputType.IsPlainText() {
+			if _, ok := checkToolUse.FinalOutput.Value.(string); !ok {
+				checkToolUse.FinalOutput = param.NewOpt[any](fmt.Sprintf("%v", checkToolUse.FinalOutput.Value))
+			}
+		}
+
+		return ri.ExecuteFinalOutput(
+			ctx,
+			agent,
+			originalInput,
+			newResponse,
+			preStepItems,
+			newStepItems,
+			checkToolUse.FinalOutput.Or(nil),
+			hooks,
+		)
+	}
+
+	// Now we can check if the model also produced a final output
+	messageItems := make([]MessageOutputItem, 0)
+	for _, item := range newStepItems {
+		if messageItem, ok := item.(MessageOutputItem); ok {
+			messageItems = append(messageItems, messageItem)
+		}
+	}
+
+	// We'll use the last content output as the final output
+	potentialFinalOutputText := ""
+	if len(messageItems) > 0 {
+		rawItem := messageItems[len(messageItems)-1].RawItem
+		potentialFinalOutputText, _ = ItemHelpers().ExtractLastText(
+			openaitypes.ResponseOutputItemUnionFromResponseOutputMessage(rawItem))
+	}
+
+	// There are two possibilities that lead to a final output:
+	// 1. Structured output type => always leads to a final output
+	// 2. Plain text output type => only leads to a final output if there are no tool calls
+	if outputType != nil && !outputType.IsPlainText() && potentialFinalOutputText != "" {
+		finalOutput, err := outputType.ValidateJSON(ctx, potentialFinalOutputText)
+		if err != nil {
+			return nil, fmt.Errorf("final output type JSON validation failed: %w", err)
+		}
+		return ri.ExecuteFinalOutput(
+			ctx,
+			agent,
+			originalInput,
+			newResponse,
+			preStepItems,
+			newStepItems,
+			finalOutput,
+			hooks,
+		)
+	} else if (outputType == nil || outputType.IsPlainText()) && !processedResponse.HasToolsOrApprovalsToRun() {
+		return ri.ExecuteFinalOutput(
+			ctx,
+			agent,
+			originalInput,
+			newResponse,
+			preStepItems,
+			newStepItems,
+			potentialFinalOutputText,
+			hooks,
+		)
+	} else {
+		// If there's no final output, we can just run again
+		return &SingleStepResult{
+			OriginalInput: originalInput,
+			ModelResponse: newResponse,
+			PreStepItems:  preStepItems,
+			NewStepItems:  newStepItems,
+			NextStep:      NextStepRunAgain{},
+		}, nil
+	}
+}
+
+// MaybeResetToolChoice resets tool choice to nil if the agent has used tools
+// and the agent's ResetToolChoice flag is true.
+func (runImpl) MaybeResetToolChoice(
+	agent *Agent,
+	toolUseTracker *AgentToolUseTracker,
+	modelSettings modelsettings.ModelSettings,
+) modelsettings.ModelSettings {
+	resetToolChoice := agent.ResetToolChoice.Or(true)
+	if resetToolChoice && toolUseTracker.HasUsedTools(agent) {
+		newSettings := modelSettings
+		newSettings.ToolChoice = nil
+		return newSettings
+	}
+	return modelSettings
+}
+
+func (runImpl) ProcessModelResponse(
+	ctx context.Context,
+	agent *Agent,
+	allTools []Tool,
+	response ModelResponse,
+	handoffs []Handoff,
+) (*ProcessedResponse, error) {
+	var (
+		items               []RunItem
+		runHandoffs         []ToolRunHandoff
+		functions           []ToolRunFunction
+		computerActions     []ToolRunComputerAction
+		localShellCalls     []ToolRunLocalShellCall
+		mcpApprovalRequests []ToolRunMCPApprovalRequest
+		computerTool        *ComputerTool
+		localShellTool      *LocalShellTool
+		toolsUsed           []string
+	)
+
+	handoffMap := make(map[string]Handoff, len(handoffs))
+	for _, handoff := range handoffs {
+		handoffMap[handoff.ToolName] = handoff
+	}
+
+	functionMap := make(map[string]FunctionTool)
+	hostedMCPServerMap := make(map[string]HostedMCPTool)
+
+	for _, tool := range allTools {
+		switch t := tool.(type) {
+		case FunctionTool:
+			functionMap[t.Name] = t
+		case ComputerTool:
+			computerTool = &t
+		case LocalShellTool:
+			localShellTool = &t
+		case HostedMCPTool:
+			hostedMCPServerMap[t.ToolConfig.ServerLabel] = t
+		}
+	}
+
+	for _, outputUnion := range response.Output {
+		switch outputUnion.Type {
+		case "message":
+			output := responses.ResponseOutputMessage{
+				ID:      outputUnion.ID,
+				Content: outputUnion.Content,
+				Role:    constant.Assistant(outputUnion.Role),
+				Status:  responses.ResponseOutputMessageStatus(outputUnion.Status),
+				Type:    constant.ValueOf[constant.Message](),
+			}
+			items = append(items, MessageOutputItem{
+				Agent:   agent,
+				RawItem: output,
+				Type:    "message_output_item",
+			})
+		case "file_search_call":
+			output := responses.ResponseFileSearchToolCall{
+				ID:      outputUnion.ID,
+				Queries: outputUnion.Queries,
+				Status:  responses.ResponseFileSearchToolCallStatus(outputUnion.Status),
+				Type:    constant.ValueOf[constant.FileSearchCall](),
+				Results: outputUnion.Results,
+			}
+			items = append(items, ToolCallItem{
+				Agent:   agent,
+				RawItem: ResponseFileSearchToolCall(output),
+				Type:    "tool_call_item",
+			})
+			toolsUsed = append(toolsUsed, "file_search")
+		case "web_search_call":
+			output := responses.ResponseFunctionWebSearch{
+				ID:     outputUnion.ID,
+				Action: openaitypes.ResponseFunctionWebSearchActionUnionFromResponseOutputItemUnionAction(outputUnion.Action),
+				Status: responses.ResponseFunctionWebSearchStatus(outputUnion.Status),
+				Type:   constant.ValueOf[constant.WebSearchCall](),
+			}
+			items = append(items, ToolCallItem{
+				Agent:   agent,
+				RawItem: ResponseFunctionWebSearch(output),
+				Type:    "tool_call_item",
+			})
+			toolsUsed = append(toolsUsed, "web_search")
+		case "reasoning":
+			output := responses.ResponseReasoningItem{
+				ID:               outputUnion.ID,
+				Summary:          outputUnion.Summary,
+				Type:             constant.ValueOf[constant.Reasoning](),
+				EncryptedContent: outputUnion.EncryptedContent,
+				Status:           responses.ResponseReasoningItemStatus(outputUnion.Status),
+			}
+			items = append(items, ReasoningItem{
+				Agent:   agent,
+				RawItem: output,
+				Type:    "reasoning_item",
+			})
+		case "computer_call":
+			output := responses.ResponseComputerToolCall{
+				ID:                  outputUnion.ID,
+				Action:              openaitypes.ResponseComputerToolCallActionUnionFromResponseOutputItemUnionAction(outputUnion.Action),
+				CallID:              outputUnion.CallID,
+				PendingSafetyChecks: outputUnion.PendingSafetyChecks,
+				Status:              responses.ResponseComputerToolCallStatus(outputUnion.Status),
+				Type:                responses.ResponseComputerToolCallTypeComputerCall,
+			}
+			items = append(items, ToolCallItem{
+				Agent:   agent,
+				RawItem: ResponseComputerToolCall(output),
+				Type:    "tool_call_item",
+			})
+			toolsUsed = append(toolsUsed, "computer_use")
+			if computerTool == nil {
+				AttachErrorToCurrentSpan(ctx, tracing.SpanError{Message: "Computer tool not found"})
+				return nil, NewModelBehaviorError("model produced computer action without a computer tool")
+			}
+			computerActions = append(computerActions, ToolRunComputerAction{
+				ToolCall:     output,
+				ComputerTool: *computerTool,
+			})
+		case "mcp_approval_request":
+			arguments, err := responseOutputItemStringArguments(outputUnion)
+			if err != nil {
+				AttachErrorToCurrentSpan(ctx, tracing.SpanError{
+					Message: "Invalid MCP approval request arguments",
+					Data:    map[string]any{"item_type": outputUnion.Type, "field": "arguments"},
+				})
+				return nil, err
+			}
+			output := responses.ResponseOutputItemMcpApprovalRequest{
+				ID:          outputUnion.ID,
+				Arguments:   arguments,
+				Name:        outputUnion.Name,
+				ServerLabel: outputUnion.ServerLabel,
+				Type:        constant.ValueOf[constant.McpApprovalRequest](),
+			}
+			items = append(items, MCPApprovalRequestItem{
+				Agent:   agent,
+				RawItem: output,
+				Type:    "mcp_approval_request_item",
+			})
+			if server, ok := hostedMCPServerMap[output.ServerLabel]; !ok {
+				AttachErrorToCurrentSpan(ctx, tracing.SpanError{
+					Message: "MCP server label not found",
+					Data:    map[string]any{"server_label": output.ServerLabel},
+				})
+				return nil, ModelBehaviorErrorf("MCP server label %q not found", output.ServerLabel)
+			} else if server.OnApprovalRequest != nil {
+				mcpApprovalRequests = append(mcpApprovalRequests, ToolRunMCPApprovalRequest{
+					RequestItem: output,
+					MCPTool:     server,
+				})
+			} else {
+				Logger().Warn("MCP server has no OnApprovalRequest hook",
+					slog.String("serverLabel", output.ServerLabel))
+			}
+		case "mcp_list_tools":
+			output := responses.ResponseOutputItemMcpListTools{
+				ID:          outputUnion.ID,
+				ServerLabel: outputUnion.ServerLabel,
+				Tools:       outputUnion.Tools.OfResponseOutputItemMcpListToolsTools,
+				Type:        constant.ValueOf[constant.McpListTools](),
+				Error:       outputUnion.Error,
+			}
+			items = append(items, MCPListToolsItem{
+				Agent:   agent,
+				RawItem: output,
+				Type:    "mcp_list_tools_item",
+			})
+		case "mcp_call":
+			arguments, err := responseOutputItemStringArguments(outputUnion)
+			if err != nil {
+				AttachErrorToCurrentSpan(ctx, tracing.SpanError{
+					Message: "Invalid MCP call arguments",
+					Data:    map[string]any{"item_type": outputUnion.Type, "field": "arguments"},
+				})
+				return nil, err
+			}
+			outputValue, err := responseOutputItemStringMCPOutput(outputUnion)
+			if err != nil {
+				AttachErrorToCurrentSpan(ctx, tracing.SpanError{
+					Message: "Invalid MCP call output",
+					Data:    map[string]any{"item_type": outputUnion.Type, "field": "output"},
+				})
+				return nil, err
+			}
+			output := responses.ResponseOutputItemMcpCall{
+				ID:          outputUnion.ID,
+				Arguments:   arguments,
+				Name:        outputUnion.Name,
+				ServerLabel: outputUnion.ServerLabel,
+				Type:        constant.ValueOf[constant.McpCall](),
+				Error:       outputUnion.Error,
+				Output:      outputValue,
+			}
+			items = append(items, ToolCallItem{
+				Agent:   agent,
+				RawItem: ResponseOutputItemMcpCall(output),
+				Type:    "tool_call_item",
+			})
+			toolsUsed = append(toolsUsed, "mcp")
+		case "image_generation_call":
+			output := responses.ResponseOutputItemImageGenerationCall{
+				ID:     outputUnion.ID,
+				Result: outputUnion.Result,
+				Status: outputUnion.Status,
+				Type:   constant.ValueOf[constant.ImageGenerationCall](),
+			}
+			items = append(items, ToolCallItem{
+				Agent:   agent,
+				RawItem: ResponseOutputItemImageGenerationCall(output),
+				Type:    "tool_call_item",
+			})
+			toolsUsed = append(toolsUsed, "image_generation")
+		case "code_interpreter_call":
+			output := responses.ResponseCodeInterpreterToolCall{
+				ID:          outputUnion.ID,
+				Code:        outputUnion.Code,
+				Outputs:     outputUnion.Outputs,
+				Status:      responses.ResponseCodeInterpreterToolCallStatus(outputUnion.Status),
+				Type:        constant.ValueOf[constant.CodeInterpreterCall](),
+				ContainerID: outputUnion.ContainerID,
+			}
+			items = append(items, ToolCallItem{
+				Agent:   agent,
+				RawItem: ResponseCodeInterpreterToolCall(output),
+				Type:    "tool_call_item",
+			})
+			toolsUsed = append(toolsUsed, "code_interpreter")
+		case "local_shell_call":
+			output := responses.ResponseOutputItemLocalShellCall{
+				ID:     outputUnion.ID,
+				Action: openaitypes.ResponseOutputItemLocalShellCallActionFromResponseOutputItemUnionAction(outputUnion.Action),
+				CallID: outputUnion.CallID,
+				Status: outputUnion.Status,
+				Type:   constant.ValueOf[constant.LocalShellCall](),
+			}
+			items = append(items, ToolCallItem{
+				Agent:   agent,
+				RawItem: ResponseOutputItemLocalShellCall(output),
+				Type:    "tool_call_item",
+			})
+			toolsUsed = append(toolsUsed, "local_shell")
+			if localShellTool == nil {
+				AttachErrorToCurrentSpan(ctx, tracing.SpanError{Message: "Local shell tool not found"})
+				return nil, NewModelBehaviorError("model produced local shell call without a local shell tool")
+			}
+			localShellCalls = append(localShellCalls, ToolRunLocalShellCall{
+				ToolCall:       output,
+				LocalShellTool: *localShellTool,
+			})
+		case "function_call":
+			arguments, err := responseOutputItemStringArguments(outputUnion)
+			if err != nil {
+				AttachErrorToCurrentSpan(ctx, tracing.SpanError{
+					Message: "Invalid function call arguments",
+					Data:    map[string]any{"item_type": outputUnion.Type, "field": "arguments"},
+				})
+				return nil, err
+			}
+			output := responses.ResponseFunctionToolCall{
+				Arguments: arguments,
+				CallID:    outputUnion.CallID,
+				Name:      outputUnion.Name,
+				Type:      constant.ValueOf[constant.FunctionCall](),
+				ID:        outputUnion.ID,
+				Status:    responses.ResponseFunctionToolCallStatus(outputUnion.Status),
+			}
+
+			toolsUsed = append(toolsUsed, output.Name)
+
+			// Handoffs
+			if handoff, ok := handoffMap[output.Name]; ok {
+				items = append(items, HandoffCallItem{
+					Agent:   agent,
+					RawItem: output,
+					Type:    "handoff_call_item",
+				})
+				runHandoffs = append(runHandoffs, ToolRunHandoff{
+					Handoff:  handoff,
+					ToolCall: ResponseFunctionToolCall(output),
+				})
+			} else { // Regular function tool call
+				functionTool, ok := functionMap[output.Name]
+				if !ok {
+					AttachErrorToCurrentSpan(ctx, tracing.SpanError{
+						Message: "Tool not found",
+						Data:    map[string]any{"tool_name": output.Name},
+					})
+					return nil, ModelBehaviorErrorf("tool %s not found in agent %s", output.Name, agent.Name)
+				}
+				items = append(items, ToolCallItem{
+					Agent:   agent,
+					RawItem: ResponseFunctionToolCall(output),
+					Type:    "tool_call_item",
+				})
+				functions = append(functions, ToolRunFunction{
+					ToolCall:     ResponseFunctionToolCall(output),
+					FunctionTool: functionTool,
+				})
+			}
+		default:
+			Logger().Warn(fmt.Sprintf("unexpected output type, ignoring %q", outputUnion.Type))
+		}
+	}
+
+	return &ProcessedResponse{
+		NewItems:            items,
+		Handoffs:            runHandoffs,
+		Functions:           functions,
+		ComputerActions:     computerActions,
+		LocalShellCalls:     localShellCalls,
+		ToolsUsed:           toolsUsed,
+		MCPApprovalRequests: mcpApprovalRequests,
+	}, nil
+}
+
+func responseOutputItemStringArguments(output responses.ResponseOutputItemUnion) (string, error) {
+	arguments := output.Arguments
+	if arguments.JSON.OfResponseToolSearchCallArguments.Valid() && !arguments.JSON.OfString.Valid() ||
+		arguments.OfResponseToolSearchCallArguments != nil && !arguments.JSON.OfString.Valid() {
+		return "", ModelBehaviorErrorf("%s arguments must be a string", output.Type)
+	}
+	return arguments.OfString, nil
+}
+
+func responseOutputItemStringMCPOutput(output responses.ResponseOutputItemUnion) (string, error) {
+	value := output.Output
+	if value.JSON.OfOutputContentList.Valid() ||
+		value.JSON.OfResponseFunctionShellToolCallOutputOutputArray.Valid() ||
+		value.JSON.Type.Valid() ||
+		len(value.OfOutputContentList) != 0 ||
+		len(value.OfResponseFunctionShellToolCallOutputOutputArray) != 0 ||
+		value.OfOutputContentList != nil ||
+		value.OfResponseFunctionShellToolCallOutputOutputArray != nil ||
+		value.Type != "" || value.FileID != "" || value.ImageURL != "" {
+		return "", ModelBehaviorErrorf("%s output must be a string", output.Type)
+	}
+	return value.OfString, nil
+}
+
+type FunctionToolResult struct {
+	// The tool that was run.
+	Tool FunctionTool
+
+	// The output of the tool.
+	Output any
+
+	// The run item that was produced as a result of the tool call.
+	RunItem RunItem
+}
+
+func (runImpl) ExecuteFunctionToolCalls(
+	ctx context.Context,
+	agent *Agent,
+	toolRuns []ToolRunFunction,
+	hooks RunHooks,
+	config RunConfig,
+) ([]FunctionToolResult, error) {
+	runSingleTool := func(
+		ctx context.Context,
+		funcTool FunctionTool,
+		toolCall ResponseFunctionToolCall,
+	) (any, error) {
+		var result any
+
+		traceIncludeSensitiveData := config.TraceIncludeSensitiveData.Or(true)
+
+		errorFn := DefaultToolErrorFunction // non-fatal
+		if funcTool.FailureErrorFunction != nil {
+			errorFn = *funcTool.FailureErrorFunction
+		}
+
+		err := tracing.FunctionSpan(
+			ctx, tracing.FunctionSpanParams{Name: funcTool.Name},
+			func(ctx context.Context, spanFn tracing.Span) (err error) {
+				ctx = ContextWithToolData(ctx, toolCall.CallID, responses.ResponseFunctionToolCall(toolCall))
+				if traceIncludeSensitiveData {
+					spanFn.SpanData().(*tracing.FunctionSpanData).Input = toolCall.Arguments
+				}
+
+				defer func() {
+					if err != nil {
+						AttachErrorToCurrentSpan(ctx, tracing.SpanError{
+							Message: "Error running tool",
+							Data:    map[string]any{"tool_name": funcTool.Name, "error": err.Error()},
+						})
+					}
+				}()
+
+				var hooksErrors [2]error
+				var toolError error
+
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				defer cancel()
+
+				var wg sync.WaitGroup
+
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					err := hooks.OnToolStart(ctx, agent, funcTool)
+					if err != nil {
+						cancel()
+						hooksErrors[0] = fmt.Errorf("RunHooks.OnToolStart failed: %w", err)
+					}
+				}()
+
+				if agent.Hooks != nil {
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						err := agent.Hooks.OnToolStart(ctx, agent, funcTool, toolCall.Arguments)
+						if err != nil {
+							cancel()
+							hooksErrors[1] = fmt.Errorf("AgentHooks.OnToolStart failed: %w", err)
+						}
+					}()
+				}
+
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					result, toolError = funcTool.OnInvokeTool(ctx, toolCall.Arguments)
+					if toolError != nil && errorFn == nil {
+						cancel()
+					}
+				}()
+
+				wg.Wait()
+
+				if err = errors.Join(hooksErrors[:]...); err != nil {
+					return err
+				}
+
+				if toolError != nil {
+					if errorFn == nil {
+						return fmt.Errorf("error running tool %s: %w", funcTool.Name, toolError)
+					}
+					result, err = errorFn(ctx, toolError)
+					if err != nil {
+						return fmt.Errorf("error running tool %s: %w", funcTool.Name, err)
+					}
+					AttachErrorToCurrentSpan(ctx, tracing.SpanError{
+						Message: "Error running tool (non-fatal)",
+						Data: map[string]any{
+							"tool_name": funcTool.Name,
+							"error":     toolError.Error(),
+						},
+					})
+				}
+
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					err := hooks.OnToolEnd(ctx, agent, funcTool, result)
+					if err != nil {
+						cancel()
+						hooksErrors[0] = fmt.Errorf("RunHooks.OnToolEnd failed: %w", err)
+					}
+				}()
+
+				if agent.Hooks != nil {
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						err := agent.Hooks.OnToolEnd(ctx, agent, funcTool, result)
+						if err != nil {
+							cancel()
+							hooksErrors[1] = fmt.Errorf("AgentHooks.OnToolEnd failed: %w", err)
+						}
+					}()
+				}
+
+				wg.Wait()
+				if err = errors.Join(hooksErrors[:]...); err != nil {
+					return err
+				}
+
+				if traceIncludeSensitiveData {
+					spanFn.SpanData().(*tracing.FunctionSpanData).Output = result
+				}
+
+				return nil
+			})
+
+		if err != nil {
+			return nil, err
+		}
+		return result, nil
+	}
+
+	results := make([]any, len(toolRuns))
+	resultErrors := make([]error, len(toolRuns))
+
+	var cancel context.CancelFunc
+	ctx, cancel = context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(len(toolRuns))
+
+	for i, toolRun := range toolRuns {
+		go func() {
+			defer wg.Done()
+			results[i], resultErrors[i] = runSingleTool(ctx, toolRun.FunctionTool, toolRun.ToolCall)
+			if resultErrors[i] != nil {
+				cancel()
+			}
+		}()
+	}
+
+	wg.Wait()
+	if err := errors.Join(resultErrors...); err != nil {
+		return nil, err
+	}
+
+	functionToolResults := make([]FunctionToolResult, len(results))
+	for i, result := range results {
+		toolRun := toolRuns[i]
+
+		var strResult string
+		switch v := result.(type) {
+		case string:
+			strResult = v
+		case []byte:
+			strResult = string(v)
+		default:
+			out, err := json.Marshal(v)
+			if err != nil {
+				return nil, err
+			}
+			strResult = string(out)
+		}
+
+		functionToolResults[i] = FunctionToolResult{
+			Tool:   toolRun.FunctionTool,
+			Output: result,
+			RunItem: ToolCallOutputItem{
+				Agent: agent,
+				RawItem: ResponseInputItemFunctionCallOutputParam(
+					ItemHelpers().ToolCallOutputItem(toolRun.ToolCall, strResult)),
+				Output: result,
+				Type:   "tool_call_output_item",
+			},
+		}
+	}
+
+	return functionToolResults, nil
+}
+
+func (runImpl) ExecuteLocalShellCalls(
+	ctx context.Context,
+	agent *Agent,
+	calls []ToolRunLocalShellCall,
+	hooks RunHooks,
+) ([]RunItem, error) {
+	results := make([]RunItem, len(calls))
+
+	// Need to run these serially, because each call can affect the local shell state
+	for i, call := range calls {
+		result, err := LocalShellAction().Execute(ctx, agent, call, hooks)
+		if err != nil {
+			return nil, err
+		}
+		results[i] = result
+	}
+
+	return results, nil
+}
+
+func (runImpl) ExecuteComputerActions(
+	ctx context.Context,
+	agent *Agent,
+	actions []ToolRunComputerAction,
+	hooks RunHooks,
+) ([]RunItem, error) {
+	results := make([]RunItem, len(actions))
+
+	// Need to run these serially, because each action can affect the computer state
+	for i, action := range actions {
+		var acknowledged []responses.ResponseInputItemComputerCallOutputAcknowledgedSafetyCheckParam
+		if len(action.ToolCall.PendingSafetyChecks) > 0 && action.ComputerTool.OnSafetyCheck != nil {
+			for _, check := range action.ToolCall.PendingSafetyChecks {
+				data := ComputerToolSafetyCheckData{
+					Agent:       agent,
+					ToolCall:    action.ToolCall,
+					SafetyCheck: check,
+				}
+				ack, err := action.ComputerTool.OnSafetyCheck(ctx, data)
+				if err != nil {
+					return nil, err
+				}
+				if ack {
+					acknowledged = append(acknowledged, responses.ResponseInputItemComputerCallOutputAcknowledgedSafetyCheckParam{
+						ID:      check.ID,
+						Code:    param.NewOpt(check.Code),
+						Message: param.NewOpt(check.Message),
+					})
+				} else {
+					return nil, NewUserError("computer tool safety check was not acknowledged")
+				}
+			}
+		}
+
+		result, err := ComputerAction().Execute(ctx, agent, action, hooks, acknowledged)
+		if err != nil {
+			return nil, err
+		}
+		results[i] = result
+	}
+
+	return results, nil
+}
+
+func (runImpl) ExecuteHandoffs(
+	ctx context.Context,
+	agent *Agent,
+	originalInput Input,
+	preStepItems []RunItem,
+	newStepItems []RunItem,
+	newResponse ModelResponse,
+	runHandoffs []ToolRunHandoff,
+	hooks RunHooks,
+	runConfig RunConfig,
+) (*SingleStepResult, error) {
+	// If there is more than one handoff, add tool responses that reject those handoffs
+	multipleHandoffs := len(runHandoffs) > 1
+
+	if multipleHandoffs {
+		const outputMessage = "Multiple handoffs detected, ignoring this one."
+		for _, handoff := range runHandoffs[1:] {
+			newStepItems = append(newStepItems, ToolCallOutputItem{
+				Agent: agent,
+				RawItem: ResponseInputItemFunctionCallOutputParam(
+					ItemHelpers().ToolCallOutputItem(handoff.ToolCall, outputMessage)),
+				Output: outputMessage,
+				Type:   "tool_call_output_item",
+			})
+		}
+	}
+
+	actualHandoff := runHandoffs[0]
+	var handoff Handoff
+	var newAgent *Agent
+
+	err := tracing.HandoffSpan(
+		ctx, tracing.HandoffSpanParams{FromAgent: agent.Name},
+		func(ctx context.Context, spanHandoff tracing.Span) error {
+			handoff = actualHandoff.Handoff
+			var err error
+			newAgent, err = handoff.OnInvokeHandoff(ctx, actualHandoff.ToolCall.Arguments)
+			if err != nil {
+				return fmt.Errorf("failed to invoke handoff: %w", err)
+			}
+
+			spanHandoff.SpanData().(*tracing.HandoffSpanData).ToAgent = newAgent.Name
+			if multipleHandoffs {
+				requestedAgents := make([]string, len(runHandoffs))
+				for i, h := range runHandoffs {
+					requestedAgents[i] = h.Handoff.AgentName
+				}
+				spanHandoff.SetError(tracing.SpanError{
+					Message: "Multiple handoffs requested",
+					Data:    map[string]any{"requested_agents": requestedAgents},
+				})
+			}
+
+			return nil
+		})
+	if err != nil {
+		return nil, err
+	}
+
+	// Append a tool output item for the handoff
+	toolCallOutputItem := ItemHelpers().ToolCallOutputItem(
+		actualHandoff.ToolCall,
+		handoff.GetTransferMessage(newAgent),
+	)
+	newStepItems = append(newStepItems, HandoffOutputItem{
+		Agent: agent,
+		RawItem: TResponseInputItem{
+			OfFunctionCallOutput: &toolCallOutputItem,
+		},
+		SourceAgent: agent,
+		TargetAgent: newAgent,
+		Type:        "handoff_output_item",
+	})
+
+	childCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// Execute handoff hooks
+	var wg sync.WaitGroup
+	var handoffErrors [2]error
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		err := hooks.OnHandoff(childCtx, agent, newAgent)
+		if err != nil {
+			cancel()
+			handoffErrors[0] = fmt.Errorf("RunHooks.OnHandoff failed: %w", err)
+		}
+	}()
+
+	if agent.Hooks != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := agent.Hooks.OnHandoff(childCtx, newAgent, agent)
+			if err != nil {
+				cancel()
+				handoffErrors[1] = fmt.Errorf("AgentHooks.OnHandoff failed: %w", err)
+			}
+		}()
+	}
+
+	wg.Wait()
+	if err = errors.Join(handoffErrors[:]...); err != nil {
+		return nil, err
+	}
+
+	// If there's an input filter, filter the input for the next agent
+	inputFilter := handoff.InputFilter
+	if inputFilter == nil {
+		inputFilter = runConfig.HandoffInputFilter
+	}
+	if inputFilter != nil {
+		Logger().Debug("Filtering inputs for handoff")
+		handoffInputData := HandoffInputData{
+			InputHistory:    CopyInput(originalInput),
+			PreHandoffItems: slices.Clone(preStepItems),
+			NewItems:        slices.Clone(newStepItems),
+		}
+		filtered, err := inputFilter(ctx, handoffInputData)
+		if err != nil {
+			return nil, fmt.Errorf("handoff input filter error: %w", err)
+		}
+
+		originalInput = CopyInput(filtered.InputHistory)
+		preStepItems = slices.Clone(filtered.PreHandoffItems)
+		newStepItems = slices.Clone(filtered.NewItems)
+	}
+
+	return &SingleStepResult{
+		OriginalInput: originalInput,
+		ModelResponse: newResponse,
+		PreStepItems:  preStepItems,
+		NewStepItems:  newStepItems,
+		NextStep:      NextStepHandoff{NewAgent: newAgent},
+	}, nil
+}
+
+func (ri runImpl) ExecuteMCPApprovalRequests(
+	ctx context.Context,
+	agent *Agent,
+	approvalRequests []ToolRunMCPApprovalRequest,
+) ([]RunItem, error) {
+	if len(approvalRequests) == 0 {
+		return nil, nil
+	}
+
+	var cancel context.CancelFunc
+	ctx, cancel = context.WithCancel(ctx)
+	defer cancel()
+
+	errs := make([]error, len(approvalRequests))
+	results := make([]RunItem, len(approvalRequests))
+
+	var wg sync.WaitGroup
+	wg.Add(len(approvalRequests))
+
+	for i, approvalRequest := range approvalRequests {
+		go func() {
+			defer wg.Done()
+			results[i], errs[i] = ri.runSingleMCPApproval(ctx, agent, approvalRequest)
+			if errs[i] != nil {
+				cancel()
+			}
+		}()
+	}
+
+	wg.Wait()
+	if err := errors.Join(errs...); err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
+func (ri runImpl) runSingleMCPApproval(
+	ctx context.Context,
+	agent *Agent,
+	approvalRequest ToolRunMCPApprovalRequest,
+) (RunItem, error) {
+	callback := approvalRequest.MCPTool.OnApprovalRequest
+	if callback == nil {
+		return nil, errors.New("callback is required for MCP approval requests")
+	}
+
+	result, err := callback(ctx, approvalRequest.RequestItem)
+	if err != nil {
+		return nil, err
+	}
+
+	var reason param.Opt[string]
+	if !result.Approve && result.Reason != "" {
+		reason = param.NewOpt(result.Reason)
+	}
+
+	rawItem := responses.ResponseInputItemMcpApprovalResponseParam{
+		ApprovalRequestID: approvalRequest.RequestItem.ID,
+		Approve:           result.Approve,
+		ID:                param.Opt[string]{},
+		Reason:            reason,
+		Type:              constant.ValueOf[constant.McpApprovalResponse](),
+	}
+
+	return MCPApprovalResponseItem{
+		Agent:   agent,
+		RawItem: rawItem,
+		Type:    "mcp_approval_response_item",
+	}, nil
+}
+
+func (ri runImpl) ExecuteFinalOutput(
+	ctx context.Context,
+	agent *Agent,
+	originalInput Input,
+	newResponse ModelResponse,
+	preStepItems []RunItem,
+	newStepItems []RunItem,
+	finalOutput any,
+	hooks RunHooks,
+) (*SingleStepResult, error) {
+	// Run the onEnd hooks
+	err := ri.RunFinalOutputHooks(ctx, agent, hooks, finalOutput)
+	if err != nil {
+		return nil, err
+	}
+
+	return &SingleStepResult{
+		OriginalInput: originalInput,
+		ModelResponse: newResponse,
+		PreStepItems:  preStepItems,
+		NewStepItems:  newStepItems,
+		NextStep:      NextStepFinalOutput{Output: finalOutput},
+	}, nil
+}
+
+func (ri runImpl) RunFinalOutputHooks(
+	ctx context.Context,
+	agent *Agent,
+	hooks RunHooks,
+	finalOutput any,
+) error {
+	var hooksErrors [2]error
+
+	childCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		err := hooks.OnAgentEnd(childCtx, agent, finalOutput)
+		if err != nil {
+			cancel()
+			hooksErrors[0] = fmt.Errorf("RunHooks.OnAgentEnd failed: %w", err)
+		}
+	}()
+
+	if agent.Hooks != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := agent.Hooks.OnEnd(childCtx, agent, finalOutput)
+			if err != nil {
+				cancel()
+				hooksErrors[1] = fmt.Errorf("AgentHooks.OnEnd failed: %w", err)
+			}
+		}()
+	}
+
+	wg.Wait()
+	return errors.Join(hooksErrors[:]...)
+}
+
+func (runImpl) RunSingleInputGuardrail(
+	ctx context.Context,
+	agent *Agent,
+	guardrail InputGuardrail,
+	input Input,
+) (InputGuardrailResult, error) {
+	var result InputGuardrailResult
+
+	err := tracing.GuardrailSpan(
+		ctx, tracing.GuardrailSpanParams{Name: guardrail.Name},
+		func(ctx context.Context, spanGuardrail tracing.Span) error {
+			var err error
+			result, err = guardrail.Run(ctx, agent, input)
+			if err != nil {
+				return err
+			}
+			spanGuardrail.SpanData().(*tracing.GuardrailSpanData).Triggered = result.Output.TripwireTriggered
+			return nil
+		},
+	)
+
+	return result, err
+}
+
+func (runImpl) RunSingleOutputGuardrail(
+	ctx context.Context,
+	guardrail OutputGuardrail,
+	agent *Agent,
+	agentOutput any,
+) (OutputGuardrailResult, error) {
+	var result OutputGuardrailResult
+
+	err := tracing.GuardrailSpan(
+		ctx, tracing.GuardrailSpanParams{Name: guardrail.Name},
+		func(ctx context.Context, spanGuardrail tracing.Span) error {
+			var err error
+			result, err = guardrail.Run(ctx, agent, agentOutput)
+			if err != nil {
+				return err
+			}
+			spanGuardrail.SpanData().(*tracing.GuardrailSpanData).Triggered = result.Output.TripwireTriggered
+			return nil
+		},
+	)
+
+	return result, err
+}
+
+func (runImpl) StreamStepResultToQueue(stepResult SingleStepResult, queue *asyncqueue.Queue[StreamEvent]) {
+	for _, item := range stepResult.NewStepItems {
+		var event StreamEvent
+
+		switch item.(type) {
+		case MessageOutputItem:
+			event = NewRunItemStreamEvent(StreamEventMessageOutputCreated, item)
+		case HandoffCallItem:
+			event = NewRunItemStreamEvent(StreamEventHandoffRequested, item)
+		case HandoffOutputItem:
+			event = NewRunItemStreamEvent(StreamEventHandoffOccurred, item)
+		case ToolCallItem:
+			event = NewRunItemStreamEvent(StreamEventToolCalled, item)
+		case ToolCallOutputItem:
+			event = NewRunItemStreamEvent(StreamEventToolOutput, item)
+		case ReasoningItem:
+			event = NewRunItemStreamEvent(StreamEventReasoningItemCreated, item)
+		case MCPApprovalRequestItem:
+			event = NewRunItemStreamEvent(StreamEventMCPApprovalRequested, item)
+		case MCPListToolsItem:
+			event = NewRunItemStreamEvent(StreamEventMCPListTools, item)
+		// TODO: is it right not to handle MCPApprovalResponseItem here?
+		default:
+			Logger().Warn(fmt.Sprintf("Unexpected RunItem type %T", item))
+			event = nil
+		}
+
+		if event != nil {
+			queue.Put(event)
+		}
+	}
+}
+
+// checkForFinalOutputFromTools determines if tool results should produce a final output.
+// The returned ToolsToFinalOutputResult indicates whether final output is ready, and the output value.
+func (runImpl) checkForFinalOutputFromTools(
+	ctx context.Context,
+	agent *Agent,
+	toolResults []FunctionToolResult,
+) (ToolsToFinalOutputResult, error) {
+	if len(toolResults) == 0 {
+		return notFinalOutput, nil
+	}
+
+	toolUseBehavior := agent.ToolUseBehavior
+	if toolUseBehavior == nil {
+		toolUseBehavior = RunLLMAgain()
+	}
+
+	return toolUseBehavior.ToolsToFinalOutput(ctx, toolResults)
+}
+
+// ManageTraceCtx creates a trace only if there is no current trace, and manages the trace lifecycle around the given function.
+func ManageTraceCtx(ctx context.Context, params tracing.TraceParams, fn func(context.Context) error) error {
+	if ct := tracing.GetCurrentTrace(ctx); ct != nil {
+		return fn(ctx)
+	}
+	return tracing.RunTrace(ctx, params, func(ctx context.Context, _ tracing.Trace) error {
+		return fn(ctx)
+	})
+}
+
+type computerAction struct{}
+
+func ComputerAction() computerAction { return computerAction{} }
+
+func (ca computerAction) Execute(
+	ctx context.Context,
+	agent *Agent,
+	action ToolRunComputerAction,
+	hooks RunHooks,
+	acknowledgedSafetyChecks []responses.ResponseInputItemComputerCallOutputAcknowledgedSafetyCheckParam,
+) (RunItem, error) {
+	var (
+		hooksErrors [2]error
+		toolError   error
+		output      string
+	)
+
+	childCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		err := hooks.OnToolStart(childCtx, agent, action.ComputerTool)
+		if err != nil {
+			cancel()
+			hooksErrors[0] = fmt.Errorf("RunHooks.OnToolStart failed: %w", err)
+		}
+	}()
+
+	if agent.Hooks != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := agent.Hooks.OnToolStart(childCtx, agent, action.ComputerTool, nil)
+			if err != nil {
+				cancel()
+				hooksErrors[1] = fmt.Errorf("AgentHooks.OnToolStart failed: %w", err)
+			}
+		}()
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		output, toolError = ca.getScreenshot(ctx, action.ComputerTool.Computer, action.ToolCall)
+		if toolError != nil {
+			cancel()
+		}
+	}()
+
+	wg.Wait()
+
+	if err := errors.Join(hooksErrors[:]...); err != nil {
+		return nil, err
+	}
+	if toolError != nil {
+		return nil, fmt.Errorf("error running computer tool: %w", toolError)
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		err := hooks.OnToolEnd(childCtx, agent, action.ComputerTool, output)
+		if err != nil {
+			cancel()
+			hooksErrors[0] = fmt.Errorf("RunHooks.OnToolEnd failed: %w", err)
+		}
+	}()
+
+	if agent.Hooks != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := agent.Hooks.OnToolEnd(childCtx, agent, action.ComputerTool, output)
+			if err != nil {
+				cancel()
+				hooksErrors[1] = fmt.Errorf("AgentHooks.OnToolEnd failed: %w", err)
+			}
+		}()
+	}
+
+	wg.Wait()
+	if err := errors.Join(hooksErrors[:]...); err != nil {
+		return nil, err
+	}
+
+	// TODO: don't send a screenshot every single time, use references
+	imageURL := "data:image/png;base64," + output
+	return ToolCallOutputItem{
+		Agent: agent,
+		RawItem: ResponseInputItemComputerCallOutputParam{
+			CallID: action.ToolCall.CallID,
+			Output: responses.ResponseComputerToolCallOutputScreenshotParam{
+				ImageURL: param.NewOpt(imageURL),
+				Type:     constant.ValueOf[constant.ComputerScreenshot](),
+			},
+			Type:                     constant.ValueOf[constant.ComputerCallOutput](),
+			AcknowledgedSafetyChecks: acknowledgedSafetyChecks,
+		},
+		Output: imageURL,
+		Type:   "tool_call_output_item",
+	}, nil
+}
+
+func (computerAction) getScreenshot(
+	ctx context.Context,
+	comp computer.Computer,
+	toolCall responses.ResponseComputerToolCall,
+) (string, error) {
+	action := toolCall.Action
+
+	var err error
+	switch action.Type {
+	case "click":
+		err = comp.Click(ctx, action.X, action.Y, computer.Button(action.Button))
+	case "double_click":
+		err = comp.DoubleClick(ctx, action.X, action.Y)
+	case "drag":
+		path := make([]computer.Position, len(action.Path))
+		for i, p := range action.Path {
+			path[i] = computer.Position{X: p.X, Y: p.Y}
+		}
+		err = comp.Drag(ctx, path)
+	case "keypress":
+		err = comp.Keypress(ctx, action.Keys)
+	case "move":
+		err = comp.Move(ctx, action.X, action.Y)
+	case "screenshot":
+		_, err = comp.Screenshot(ctx)
+	case "scroll":
+		err = comp.Scroll(ctx, action.X, action.Y, action.ScrollX, action.ScrollY)
+	case "type":
+		err = comp.Type(ctx, action.Text)
+	case "wait":
+		err = comp.Wait(ctx)
+	default:
+		err = fmt.Errorf("unexpected ResponseComputerToolCallActionUnion type %q", action.Type)
+	}
+	if err != nil {
+		return "", err
+	}
+
+	return comp.Screenshot(ctx)
+}
+
+type localShellAction struct{}
+
+func LocalShellAction() localShellAction { return localShellAction{} }
+
+func (localShellAction) Execute(
+	ctx context.Context,
+	agent *Agent,
+	call ToolRunLocalShellCall,
+	hooks RunHooks,
+) (RunItem, error) {
+	var hooksErrors [2]error
+
+	childCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		err := hooks.OnToolStart(childCtx, agent, call.LocalShellTool)
+		if err != nil {
+			cancel()
+			hooksErrors[0] = fmt.Errorf("RunHooks.OnToolStart failed: %w", err)
+		}
+	}()
+
+	if agent.Hooks != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := agent.Hooks.OnToolStart(childCtx, agent, call.LocalShellTool, nil)
+			if err != nil {
+				cancel()
+				hooksErrors[1] = fmt.Errorf("AgentHooks.OnToolStart failed: %w", err)
+			}
+		}()
+	}
+
+	wg.Wait()
+	if err := errors.Join(hooksErrors[:]...); err != nil {
+		return nil, err
+	}
+
+	// TODO: why this does not run concurrently with the hooks, as for other tools?
+	request := LocalShellCommandRequest{Data: call.ToolCall}
+	result, err := call.LocalShellTool.Executor(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		err := hooks.OnToolEnd(childCtx, agent, call.LocalShellTool, result)
+		if err != nil {
+			cancel()
+			hooksErrors[0] = fmt.Errorf("RunHooks.OnToolEnd failed: %w", err)
+		}
+	}()
+
+	if agent.Hooks != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := agent.Hooks.OnToolEnd(childCtx, agent, call.LocalShellTool, result)
+			if err != nil {
+				cancel()
+				hooksErrors[1] = fmt.Errorf("AgentHooks.OnToolEnd failed: %w", err)
+			}
+		}()
+	}
+
+	wg.Wait()
+	if err = errors.Join(hooksErrors[:]...); err != nil {
+		return nil, err
+	}
+
+	return ToolCallOutputItem{
+		Agent: agent,
+		RawItem: ResponseInputItemLocalShellCallOutputParam{
+			ID:     call.ToolCall.CallID,
+			Output: result,
+			Status: "",
+			Type:   constant.ValueOf[constant.LocalShellCallOutput](),
+		},
+		Output: result,
+		Type:   "tool_call_output_item",
+	}, nil
+}
